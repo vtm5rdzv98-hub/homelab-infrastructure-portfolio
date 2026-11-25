@@ -1,0 +1,4 @@
+services:
+  prometheus:
+    volumes:
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro

@@ -1,0 +1,365 @@
+---
+- ansible.builtin.import_playbook: recovery-inventory-preflight.yml
+
+- name: Test Prometheus recovery from a backup
+  hosts: "{{ lookup('ansible.builtin.env', 'RECOVERY_TARGET') | default('recovery-unselected', true) }}"
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+
+  environment:
+    DOCKER_CONTEXT: ""
+  vars:
+    recovery_target: "{{ lookup('ansible.builtin.env', 'RECOVERY_TARGET') }}"
+    recovery_mode: "{{ lookup('ansible.builtin.env', 'RECOVERY_MODE') }}"
+    recovery_hostname: "{{ lookup('ansible.builtin.env', 'RECOVERY_HOSTNAME') }}"
+    backup_run_id: "{{ lookup('ansible.builtin.env', 'RECOVERY_RUN') }}"
+    backup_root: "{{ lookup('ansible.builtin.env', 'RECOVERY_BACKUP_ROOT') | default('/home/labadmin/homelab-monitoring-backups', true) }}"
+    backup_archive: >-
+      {{ backup_root }}/{{ backup_run_id }}/prometheus.tar.gz
+    recovery_end_epoch: >-
+      {{ ((backup_run_id | to_datetime('%Y%m%dT%H%M%SZ')) -
+      ('19700101T000000Z' | to_datetime('%Y%m%dT%H%M%SZ'))).total_seconds() | int }}
+    recovery_window_seconds: "{{ lookup('ansible.builtin.env', 'RECOVERY_WINDOW_SECONDS') | default('1800', true) }}"
+    test_container: "homelab-prometheus-restore-test-{{ backup_run_id }}"
+
+  tasks:
+    - ansible.builtin.import_tasks: ../tasks/verify-recovery-host.yml
+
+    - name: Require a bounded historical query window
+      ansible.builtin.assert:
+        that:
+          - recovery_window_seconds is match('^[0-9]+$')
+          - (recovery_window_seconds | int) >= 60
+          - (recovery_window_seconds | int) <= 86400
+
+    - name: Verify both monitoring archive checksums before extraction
+      ansible.builtin.import_tasks: ../tasks/verify-monitoring-archives.yml
+
+    - name: Check backup archive
+      ansible.builtin.stat:
+        path: "{{ backup_archive }}"
+      register: archive
+
+    - name: Require existing archive
+      ansible.builtin.assert:
+        that:
+          - archive.stat.isreg | default(false)
+
+    - name: Confirm Prometheus image is available locally
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --host
+          - unix:///var/run/docker.sock
+          - image
+          - inspect
+          - prom/prometheus:v3.16.0
+      changed_when: false
+
+    - name: Check temporary container name is unused
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --host
+          - unix:///var/run/docker.sock
+          - container
+          - inspect
+          - "{{ test_container }}"
+      register: existing_container
+      changed_when: false
+      failed_when: false
+
+    - name: Require an unused test container name
+      ansible.builtin.assert:
+        that:
+          - existing_container.rc != 0
+
+    - name: Create isolated working directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /var/tmp
+        suffix: _prometheus_startup
+      register: workdir
+
+    - name: Run isolated application recovery test
+      block:
+        - name: Create restore data directory
+          ansible.builtin.file:
+            path: "{{ workdir.path }}/data"
+            state: directory
+            mode: '0700'
+
+        - name: Extract archived TSDB
+          ansible.builtin.script:
+            cmd: >-
+              ../files/extract-recovery-archive.py
+              {{ backup_archive | quote }} {{ (workdir.path ~ '/data') | quote }}
+            executable: /usr/bin/python3
+
+        - name: Set ownership of temporary restored data
+          ansible.builtin.file:
+            path: "{{ workdir.path }}/data"
+            state: directory
+            owner: "65534"
+            group: "65534"
+            recurse: true
+
+        - name: Create isolated Prometheus configuration
+          ansible.builtin.copy:
+            dest: "{{ workdir.path }}/prometheus.yml"
+            mode: '0600'
+            owner: "65534"
+            group: "65534"
+            content: |
+              global:
+                scrape_interval: 60s
+              scrape_configs: []
+
+        - name: Create the isolated Prometheus container
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - create
+              - --label
+              - "dev.homelab.recovery={{ backup_run_id }}"
+              - --pull
+              - never
+              - --name
+              - "{{ test_container }}"
+              - --network
+              - none
+              - --read-only
+              - --tmpfs
+              - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+              - --memory
+              - 512m
+              - --cpus=1
+              - --pids-limit=256
+              - --cap-drop=ALL
+              - --security-opt
+              - no-new-privileges
+              - --user
+              - "65534:65534"
+              - --mount
+              - "type=bind,source={{ workdir.path }}/data,target=/prometheus"
+              - --mount
+              - "type=bind,source={{ workdir.path }}/prometheus.yml,target=/etc/prometheus/prometheus.yml,readonly"
+              - --entrypoint
+              - /bin/prometheus
+              - prom/prometheus:v3.16.0
+              - --config.file=/etc/prometheus/prometheus.yml
+              - --storage.tsdb.path=/prometheus
+              - --storage.tsdb.retention.time=3650d
+              - --web.listen-address=127.0.0.1:9090
+          register: test_run
+
+        - ansible.builtin.include_tasks: ../tasks/inspect-recovery-container.yml
+          vars:
+            recovery_mounts:
+              - source: "{{ workdir.path }}/data"
+                destination: /prometheus
+                writable: true
+              - source: "{{ workdir.path }}/prometheus.yml"
+                destination: /etc/prometheus/prometheus.yml
+                writable: false
+
+        - name: Start the verified isolated Prometheus container
+          ansible.builtin.command:
+            argv: [docker, --host, 'unix:///var/run/docker.sock', start, "{{ test_run.stdout }}"]
+
+        - name: Allow temporary container to initialize
+          ansible.builtin.pause:
+            seconds: 4
+
+        - name: Check temporary container is running
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - ps
+              - --quiet
+              - --filter
+              - "name=^/{{ test_container }}$"
+          register: temporary_status
+          changed_when: false
+
+        - name: Require temporary container to be running
+          ansible.builtin.assert:
+            that:
+              - temporary_status.stdout | trim | length > 0
+            fail_msg: "Temporary Prometheus exited during startup."
+
+        - name: Wait for restored Prometheus to become ready
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - exec
+              - "{{ test_container }}"
+              - /bin/promtool
+              - check
+              - ready
+              - --url=http://127.0.0.1:9090
+          register: readiness
+          retries: 20
+          delay: 3
+          until: readiness.rc == 0
+          changed_when: false
+
+        - name: Collect temporary instance startup logs
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - logs
+              - "{{ test_container }}"
+          register: startup_logs
+          changed_when: false
+
+        - name: Require successful WAL replay and startup
+          ansible.builtin.assert:
+            that:
+              - >-
+                'WAL replay completed' in
+                (startup_logs.stdout ~ startup_logs.stderr)
+              - >-
+                'Server is ready to receive web requests' in
+                (startup_logs.stdout ~ startup_logs.stderr)
+
+        - name: Read temporary Prometheus namespace PID
+          ansible.builtin.command:
+            argv: [docker, --host, 'unix:///var/run/docker.sock', inspect, --format, "{{ '{{.State.Pid}}' }}", "{{ test_run.stdout }}"]
+          register: prometheus_pid
+          changed_when: false
+
+        - name: Query archived series over the window preceding the backup
+          ansible.builtin.command:
+            argv:
+              - nsenter
+              - --target
+              - "{{ prometheus_pid.stdout }}"
+              - --net
+              - curl
+              - --noproxy
+              - "*"
+              - --fail
+              - --silent
+              - --show-error
+              - --max-time
+              - "10"
+              - --get
+              - http://127.0.0.1:9090/api/v1/query_range
+              - --data-urlencode
+              - "start={{ (recovery_end_epoch | int) - (recovery_window_seconds | int) }}"
+              - --data-urlencode
+              - "end={{ recovery_end_epoch }}"
+              - --data-urlencode
+              - step=30s
+              - --data-urlencode
+              - "query={{ item.query }}"
+          loop:
+            - { label: Prometheus scrape history, query: 'up{job="prometheus"}' }
+            - { label: Gateway scrape history, query: 'up{job="lab-gw"}' }
+            - { label: Storage scrape history, query: 'up{job="lab-storage"}' }
+            - label: Storage filesystem history
+              query: 'max(node_filesystem_avail_bytes{job="lab-storage",mountpoint="/srv/homelab/data"})'
+          loop_control:
+            label: "{{ item.label }}"
+          register: historical_queries
+          changed_when: false
+
+        - name: Require multiple historical samples for each representative query
+          ansible.builtin.assert:
+            that:
+              - response.status == 'success'
+              - response.data.resultType == 'matrix'
+              - series | length > 0
+              - series | map(attribute='values') | map('length') | max >= 2
+            quiet: true
+            fail_msg: "Missing historical samples for {{ item.item.label }} in the selected archive window."
+          vars:
+            response: "{{ item.stdout | from_json }}"
+            series: "{{ response.data.result }}"
+          loop: "{{ historical_queries.results }}"
+          loop_control:
+            label: "{{ item.item.label }}"
+
+        - name: Report verified recovery
+          ansible.builtin.debug:
+            msg:
+              - "PASS: Restored Prometheus started successfully"
+              - "PASS: WAL replay completed"
+              - "PASS: Readiness check succeeded"
+              - "PASS: Archived samples returned for all three scrape jobs and the storage filesystem"
+
+      rescue:
+        - name: Inspect temporary container exit status
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - inspect
+              - --format
+              - "{{ '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' }}"
+              - "{{ test_container }}"
+          register: failed_container_state
+          changed_when: false
+          failed_when: false
+
+        - name: Capture temporary container logs
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - logs
+              - "{{ test_container }}"
+          register: failure_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Display startup diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "State: {{ failed_container_state.stdout | default('unavailable') }}"
+              - "Logs: {{ failure_logs.stderr_lines | default([]) }}"
+              - "Output: {{ failure_logs.stdout_lines | default([]) }}"
+
+        - name: Mark recovery test unsuccessful
+          ansible.builtin.fail:
+            msg: "Isolated Prometheus startup failed; inspect diagnostics above."
+
+      always:
+        - name: Remove temporary test container
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - rm
+              - -f
+              - -v
+              - "{{ test_run.stdout }}"
+          when:
+            - test_run is defined
+            - test_run.rc | default(1) == 0
+          changed_when: false
+
+        - name: Remove temporary restore directory
+          ansible.builtin.file:
+            path: "{{ workdir.path }}"
+            state: absent
+
+    - name: Verify host Prometheus still responds
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9090/-/ready
+        status_code: 200
+        use_proxy: false
+      changed_when: false

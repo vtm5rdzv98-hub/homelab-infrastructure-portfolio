@@ -1,0 +1,59 @@
+name: homelab
+services:
+  portal:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    ports:
+      - "${LAB_MGMT_IP:-192.168.56.10}:8080:80"
+    volumes:
+      - ./portal:/usr/share/caddy:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    profiles: [observability]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+    expose:
+      - "9090"
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    restart: unless-stopped
+    profiles: [observability]
+    ports:
+      - "${LAB_MGMT_IP:-192.168.56.10}:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Copy .env.example to .env and set a strong password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: homelab_services
+    ipam:
+      config:
+        - subnet: 172.30.77.0/24

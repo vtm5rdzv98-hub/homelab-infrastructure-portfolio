@@ -1,0 +1,70 @@
+---
+- name: Compare Docker repository and deployed files
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    repo_services: "{{ playbook_dir }}/../../services"
+    remote_services: /home/labadmin/homelab-services
+
+    deployment_files:
+      - portal/compose.yaml
+      - portal/site/index.html
+      - monitoring/compose.yaml
+      - monitoring/compose.grafana.yaml
+      - monitoring/compose.alerts.yaml
+      - monitoring/prometheus.yml
+      - monitoring/alerts.yml
+      - monitoring/grafana/dashboards/homelab-overview.json
+      - monitoring/grafana/provisioning/dashboards/home.yaml
+      - monitoring/grafana/provisioning/datasources/prometheus.yaml
+
+  tasks:
+    - name: Read repository file checksums on Mac
+      ansible.builtin.stat:
+        path: "{{ repo_services }}/{{ item }}"
+        checksum_algorithm: sha256
+        get_mime: false
+      loop: "{{ deployment_files }}"
+      register: local_files
+      delegate_to: localhost
+      become: false
+
+    - name: Verify repository files exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists | default(false)
+          - item.stat.isreg | default(false)
+        fail_msg: "Missing repository file: {{ item.item }}"
+      loop: "{{ local_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read deployed file checksums on gateway
+      ansible.builtin.stat:
+        path: "{{ remote_services }}/{{ item }}"
+        checksum_algorithm: sha256
+        get_mime: false
+      loop: "{{ deployment_files }}"
+      register: remote_files
+
+    - name: Compare repository against gateway
+      ansible.builtin.debug:
+        msg: >-
+          {{ pair.0.item }}:
+          {{
+            'MISSING ON GATEWAY'
+            if not (pair.1.stat.exists | default(false))
+            else
+            (
+              'MATCH'
+              if pair.0.stat.checksum ==
+                 (pair.1.stat.checksum | default(''))
+              else 'DIFFERENT'
+            )
+          }}
+      loop: "{{ local_files.results | zip(remote_files.results) | list }}"
+      loop_control:
+        loop_var: pair
+        label: "{{ pair.0.item }}"

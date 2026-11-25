@@ -1,0 +1,95 @@
+---
+- name: Audit existing HomeLab Docker deployments
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    deployment_root: /home/labadmin/homelab-services
+
+  tasks:
+    - name: Check required deployment files
+      ansible.builtin.stat:
+        path: "{{ deployment_root }}/{{ item }}"
+      loop:
+        - portal/compose.yaml
+        - monitoring/compose.yaml
+        - monitoring/compose.grafana.yaml
+        - monitoring/compose.alerts.yaml
+        - monitoring/prometheus.yml
+        - monitoring/alerts.yml
+      register: deployment_files
+
+    - name: Verify all deployment files exist
+      ansible.builtin.assert:
+        that:
+          - >-
+            deployment_files.results |
+            selectattr('stat.exists', 'equalto', false) |
+            list | length == 0
+
+    - name: Validate portal Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - config
+          - --quiet
+        chdir: "{{ deployment_root }}/portal"
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect running portal containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - ps
+        chdir: "{{ deployment_root }}/portal"
+      register: portal_status
+      changed_when: false
+      check_mode: false
+
+    - name: Validate monitoring Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - -f
+          - compose.grafana.yaml
+          - -f
+          - compose.alerts.yaml
+          - config
+          - --quiet
+        chdir: "{{ deployment_root }}/monitoring"
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect running monitoring containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - -f
+          - compose.grafana.yaml
+          - -f
+          - compose.alerts.yaml
+          - ps
+        chdir: "{{ deployment_root }}/monitoring"
+      register: monitoring_status
+      changed_when: false
+      check_mode: false
+
+    - name: Display deployment status
+      ansible.builtin.debug:
+        msg:
+          - "Portal: {{ portal_status.stdout_lines }}"
+          - "Monitoring: {{ monitoring_status.stdout_lines }}"

@@ -1,0 +1,23 @@
+---
+- name: Read the selected gateway hostname before running privileged commands
+  ansible.builtin.command:
+    argv: [hostname, -s]
+  become: false
+  changed_when: false
+  register: actual_recovery_host
+
+- name: Require the selected VM and its recovery approval
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts_all == [recovery_target]
+      - actual_recovery_host.stdout == recovery_hostname
+      - backup_run_id is match('^[0-9]{8}T[0-9]{6}Z$')
+      - backup_root is match('^/')
+      - not ansible_check_mode
+      - lookup('ansible.builtin.env', 'RECOVERY_APPROVED') == 'yes'
+      - >-
+        (recovery_mode == 'isolated' and
+        recovery_hostname is match('^homelab-fresh-[a-z0-9][a-z0-9-]*-gw$')) or
+        (recovery_mode == 'original' and recovery_hostname == 'lab-gw' and
+        lookup('ansible.builtin.env', 'RECOVERY_ORIGINAL_APPROVED') == 'lab-gw')
+    fail_msg: "Recovery refused for {{ actual_recovery_host.stdout }}. Check the VM hostname, mode and approval."

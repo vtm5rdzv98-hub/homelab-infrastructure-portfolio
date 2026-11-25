@@ -1,0 +1,181 @@
+---
+- name: Back up monitoring data volumes
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    backup_root: /home/labadmin/homelab-monitoring-backups
+    backup_dir: "{{ backup_root }}/{{ backup_run_id }}"
+    grafana_container: homelab-monitoring-grafana-1
+    prometheus_container: homelab-monitoring-prometheus-1
+    grafana_volume: /var/lib/docker/volumes/homelab-monitoring_grafana_data/_data
+    prometheus_volume: /var/lib/docker/volumes/homelab-monitoring_prometheus_data/_data
+
+  tasks:
+    - name: Validate backup run ID
+      ansible.builtin.assert:
+        that:
+          - backup_run_id | default('') is match('^[0-9]{8}T[0-9]{6}Z$')
+          - not ansible_check_mode
+
+    - name: Verify monitoring containers are running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --quiet
+          - --filter
+          - "name=^/{{ item }}$"
+      loop:
+        - "{{ grafana_container }}"
+        - "{{ prometheus_container }}"
+      register: running_containers
+      changed_when: false
+
+    - name: Require both services running before backup
+      ansible.builtin.assert:
+        that:
+          - item.stdout | length > 0
+      loop: "{{ running_containers.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check backup does not already exist
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}"
+      register: existing_backup
+
+    - name: Require unique backup destination
+      ansible.builtin.assert:
+        that:
+          - not existing_backup.stat.exists
+
+    - name: Create private backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: labadmin
+        group: labadmin
+        mode: '0700'
+
+    - name: Back up Grafana consistently
+      block:
+        - name: Stop Grafana
+          ansible.builtin.command:
+            argv:
+              - docker
+              - stop
+              - --time
+              - "40"
+              - "{{ grafana_container }}"
+
+        - name: Archive Grafana volume
+          ansible.builtin.command:
+            argv:
+              - tar
+              - -C
+              - "{{ grafana_volume }}"
+              - -czf
+              - "{{ backup_dir }}/grafana.tar.gz"
+              - .
+      always:
+        - name: Ensure Grafana starts
+          ansible.builtin.command:
+            argv:
+              - docker
+              - start
+              - "{{ grafana_container }}"
+
+    - name: Verify Grafana recovered
+      ansible.builtin.uri:
+        url: http://127.0.0.1:3000/api/health
+        status_code: 200
+        use_proxy: false
+      register: grafana_health
+      retries: 12
+      delay: 5
+      until: grafana_health is succeeded
+
+    - name: Back up Prometheus consistently
+      block:
+        - name: Stop Prometheus
+          ansible.builtin.command:
+            argv:
+              - docker
+              - stop
+              - --time
+              - "40"
+              - "{{ prometheus_container }}"
+
+        - name: Archive Prometheus volume
+          ansible.builtin.command:
+            argv:
+              - tar
+              - -C
+              - "{{ prometheus_volume }}"
+              - -czf
+              - "{{ backup_dir }}/prometheus.tar.gz"
+              - .
+      always:
+        - name: Ensure Prometheus starts
+          ansible.builtin.command:
+            argv:
+              - docker
+              - start
+              - "{{ prometheus_container }}"
+
+    - name: Verify Prometheus recovered
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9090/-/ready
+        status_code: 200
+        use_proxy: false
+      register: prometheus_health
+      retries: 12
+      delay: 5
+      until: prometheus_health is succeeded
+
+    - name: Generate archive checksums
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - grafana.tar.gz
+          - prometheus.tar.gz
+        chdir: "{{ backup_dir }}"
+      register: archive_checksums
+      changed_when: false
+
+    - name: Save checksum manifest
+      ansible.builtin.copy:
+        content: "{{ archive_checksums.stdout }}\n"
+        dest: "{{ backup_dir }}/SHA256SUMS"
+        owner: labadmin
+        group: labadmin
+        mode: '0600'
+
+    - name: Secure backup archives
+      ansible.builtin.file:
+        path: "{{ backup_dir }}/{{ item }}"
+        owner: labadmin
+        group: labadmin
+        mode: '0600'
+      loop:
+        - grafana.tar.gz
+        - prometheus.tar.gz
+
+    - name: Verify archive checksums
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - --check
+          - SHA256SUMS
+        chdir: "{{ backup_dir }}"
+      register: verification
+      changed_when: false
+
+    - name: Display backup results
+      ansible.builtin.debug:
+        msg:
+          - "Backup directory: {{ backup_dir }}"
+          - "{{ verification.stdout_lines }}"
+          - "Grafana and Prometheus are responding"

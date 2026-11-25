@@ -1,0 +1,94 @@
+---
+- name: Adopt existing Docker deployments into Ansible
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    repo_root: "{{ playbook_dir }}/../../services"
+    deployment_root: /home/labadmin/homelab-services
+
+    deployment_files:
+      - portal/compose.yaml
+      - portal/site/index.html
+      - monitoring/compose.yaml
+      - monitoring/compose.grafana.yaml
+      - monitoring/compose.alerts.yaml
+      - monitoring/prometheus.yml
+      - monitoring/alerts.yml
+      - monitoring/grafana/dashboards/homelab-overview.json
+      - monitoring/grafana/provisioning/dashboards/home.yaml
+      - monitoring/grafana/provisioning/datasources/prometheus.yaml
+
+  tasks:
+    - name: Read repository checksums
+      ansible.builtin.stat:
+        path: "{{ repo_root }}/{{ item }}"
+        checksum_algorithm: sha256
+      loop: "{{ deployment_files }}"
+      register: repo_checks
+      delegate_to: localhost
+      become: false
+
+    - name: Read gateway checksums
+      ansible.builtin.stat:
+        path: "{{ deployment_root }}/{{ item }}"
+        checksum_algorithm: sha256
+      loop: "{{ deployment_files }}"
+      register: gateway_checks
+
+    - name: Refuse unexpected source differences
+      ansible.builtin.assert:
+        that:
+          - item.0.stat.isreg | default(false)
+          - item.1.stat.isreg | default(false)
+          - >-
+            (item.0.stat.checksum | default('')) ==
+            (item.1.stat.checksum | default('missing'))
+        fail_msg: "Source mismatch for {{ item.0.item }}. Deployment stopped."
+        quiet: true
+      loop: "{{ repo_checks.results | zip(gateway_checks.results) | list }}"
+      loop_control:
+        label: "{{ item.0.item }}"
+
+    - name: Manage existing deployment files
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/{{ item }}"
+        dest: "{{ deployment_root }}/{{ item }}"
+        backup: true
+      loop: "{{ deployment_files }}"
+      diff: false
+
+    - name: Validate portal Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - config
+          - --quiet
+        chdir: "{{ deployment_root }}/portal"
+      changed_when: false
+      check_mode: false
+
+    - name: Validate monitoring Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - -f
+          - compose.grafana.yaml
+          - -f
+          - compose.alerts.yaml
+          - config
+          - --quiet
+        chdir: "{{ deployment_root }}/monitoring"
+      changed_when: false
+      check_mode: false
+
+    - name: Report deployment adoption
+      ansible.builtin.debug:
+        msg: "Docker deployment files verified and managed."

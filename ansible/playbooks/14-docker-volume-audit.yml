@@ -1,0 +1,73 @@
+---
+- name: Audit persistent monitoring data
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    volume_names:
+      - homelab-monitoring_grafana_data
+      - homelab-monitoring_prometheus_data
+
+  tasks:
+    - name: Inspect Docker volumes
+      ansible.builtin.command:
+        argv: "{{ ['docker', 'volume', 'inspect'] + volume_names }}"
+      register: volume_info
+      changed_when: false
+      check_mode: false
+
+    - name: Parse volume metadata
+      ansible.builtin.set_fact:
+        volumes: "{{ volume_info.stdout | from_json }}"
+
+    - name: Verify both expected local volumes
+      ansible.builtin.assert:
+        that:
+          - volumes | length == 2
+          - >-
+            (volumes | map(attribute='Name') | sort | list) ==
+            (volume_names | sort | list)
+          - >-
+            (volumes | selectattr('Driver', 'equalto', 'local')
+            | list | length) == 2
+
+    - name: Measure volume sizes
+      ansible.builtin.command:
+        argv:
+          - du
+          - -sh
+          - "{{ item.Mountpoint }}"
+      loop: "{{ volumes }}"
+      loop_control:
+        label: "{{ item.Name }}"
+      register: volume_sizes
+      changed_when: false
+      check_mode: false
+
+    - name: Check Grafana SQLite database
+      ansible.builtin.stat:
+        path: >-
+          {{ (volumes |
+              selectattr('Name', 'equalto',
+              'homelab-monitoring_grafana_data') |
+              first).Mountpoint }}/grafana.db
+      register: grafana_db
+
+    - name: Check available gateway disk space
+      ansible.builtin.command:
+        argv:
+          - df
+          - -h
+          - "{{ volumes[0].Mountpoint }}"
+      register: disk_space
+      changed_when: false
+      check_mode: false
+
+    - name: Report backup readiness
+      ansible.builtin.debug:
+        msg:
+          - "Volumes: {{ volume_names }}"
+          - "Sizes: {{ volume_sizes.results | map(attribute='stdout') | list }}"
+          - "Grafana SQLite database exists: {{ grafana_db.stat.exists }}"
+          - "Disk space: {{ disk_space.stdout_lines }}"

@@ -1,0 +1,52 @@
+---
+- name: Adopt existing SSH hardening into Ansible
+  hosts: homelab_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars:
+    ssh_source: "{{ playbook_dir }}/../files/00-homelab-hardening.conf"
+    ssh_destination: /etc/ssh/sshd_config.d/00-homelab-hardening.conf
+
+  tasks:
+    - name: Read existing SSH hardening file
+      ansible.builtin.slurp:
+        src: "{{ ssh_destination }}"
+      register: existing_ssh
+
+    - name: Verify source matches existing configuration
+      ansible.builtin.assert:
+        that:
+          - >-
+            (existing_ssh.content | b64decode) ==
+            lookup('ansible.builtin.file', ssh_source, rstrip=False)
+        fail_msg: "SSH configuration differs. Refusing to overwrite."
+
+    - name: Manage SSH hardening file
+      ansible.builtin.copy:
+        src: "{{ ssh_source }}"
+        dest: "{{ ssh_destination }}"
+        owner: root
+        group: root
+        mode: '0600'
+        backup: true
+
+    - name: Validate complete SSH configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+      check_mode: false
+
+    - name: Read effective SSH settings
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: ssh_settings
+      changed_when: false
+      check_mode: false
+
+    - name: Confirm SSH security requirements
+      ansible.builtin.assert:
+        that:
+          - "'passwordauthentication no' in ssh_settings.stdout_lines"
+          - "'kbdinteractiveauthentication no' in ssh_settings.stdout_lines"
+          - "'permitrootlogin no' in ssh_settings.stdout_lines"
+          - "'pubkeyauthentication yes' in ssh_settings.stdout_lines"

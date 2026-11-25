@@ -1,0 +1,11 @@
+groups:
+  - name: homelab-availability
+    rules:
+      - alert: NodeDown
+        expr: up{job=~"lab-gw|lab-storage"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node unavailable: {{ $labels.job }}"
+          description: "Prometheus cannot scrape {{ $labels.instance }}."

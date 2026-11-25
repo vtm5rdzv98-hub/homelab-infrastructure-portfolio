@@ -1,0 +1,25 @@
+---
+- name: Validate the recovery inventory on the controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    recovery_target: "{{ lookup('ansible.builtin.env', 'RECOVERY_TARGET') }}"
+    recovery_mode: "{{ lookup('ansible.builtin.env', 'RECOVERY_MODE') }}"
+    recovery_hostname: "{{ lookup('ansible.builtin.env', 'RECOVERY_HOSTNAME') }}"
+  tasks:
+    - name: Require one explicitly approved recovery host
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.env', 'RECOVERY_APPROVED') == 'yes'
+          - recovery_target is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+          - recovery_target not in ['localhost', '127.0.0.1']
+          - recovery_target in groups['all']
+          - recovery_target not in groups
+          - >-
+            (recovery_mode == 'isolated' and
+            recovery_hostname is match('^homelab-fresh-[a-z0-9][a-z0-9-]*-gw$')) or
+            (recovery_mode == 'original' and recovery_hostname == 'lab-gw' and
+            lookup('ansible.builtin.env', 'RECOVERY_ORIGINAL_APPROVED') == 'lab-gw')
+        fail_msg: "Choose one recovery inventory host, its actual VM hostname and the required approval settings."
+      any_errors_fatal: true

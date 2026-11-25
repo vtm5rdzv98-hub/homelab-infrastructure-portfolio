@@ -1,0 +1,353 @@
+---
+- ansible.builtin.import_playbook: recovery-inventory-preflight.yml
+
+- name: Test isolated Grafana recovery
+  hosts: "{{ lookup('ansible.builtin.env', 'RECOVERY_TARGET') | default('recovery-unselected', true) }}"
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+
+  environment:
+    DOCKER_CONTEXT: ""
+  vars:
+    recovery_target: "{{ lookup('ansible.builtin.env', 'RECOVERY_TARGET') }}"
+    recovery_mode: "{{ lookup('ansible.builtin.env', 'RECOVERY_MODE') }}"
+    recovery_hostname: "{{ lookup('ansible.builtin.env', 'RECOVERY_HOSTNAME') }}"
+    backup_run_id: "{{ lookup('ansible.builtin.env', 'RECOVERY_RUN') }}"
+    backup_root: "{{ lookup('ansible.builtin.env', 'RECOVERY_BACKUP_ROOT') | default('/home/labadmin/homelab-monitoring-backups', true) }}"
+    backup_archive: >-
+      {{ backup_root }}/{{ backup_run_id }}/grafana.tar.gz
+    recovery_dashboard_uid: homelab-infra
+    recovery_grafana_user: "{{ lookup('ansible.builtin.env', 'HOMELAB_RECOVERY_GRAFANA_USER') }}"
+    recovery_grafana_password: "{{ lookup('ansible.builtin.env', 'HOMELAB_RECOVERY_GRAFANA_PASSWORD') }}"
+    test_container: "homelab-grafana-restore-test-{{ backup_run_id }}"
+
+  tasks:
+    - ansible.builtin.import_tasks: ../tasks/verify-recovery-host.yml
+
+    - name: Require both optional authentication fields together
+      ansible.builtin.assert:
+        that:
+          - (recovery_grafana_user | length > 0) == (recovery_grafana_password | length > 0)
+          - recovery_dashboard_uid is match('^[a-zA-Z0-9_-]+$')
+      no_log: true
+
+    - name: Verify both monitoring archive checksums before extraction
+      ansible.builtin.import_tasks: ../tasks/verify-monitoring-archives.yml
+
+    - name: Verify backup archive exists
+      ansible.builtin.stat:
+        path: "{{ backup_archive }}"
+      register: archive
+
+    - name: Verify test prerequisites
+      ansible.builtin.assert:
+        that:
+          - archive.stat.isreg | default(false)
+
+    - name: Verify image is available locally
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --host
+          - unix:///var/run/docker.sock
+          - image
+          - inspect
+          - grafana/grafana:13.3.1
+      changed_when: false
+
+    - name: Verify nsenter is installed
+      ansible.builtin.command:
+        argv: [which, nsenter]
+      changed_when: false
+
+    - name: Inspect existing test container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --host
+          - unix:///var/run/docker.sock
+          - container
+          - inspect
+          - "{{ test_container }}"
+      register: existing
+      changed_when: false
+      failed_when: false
+
+    - name: Require unused test container name
+      ansible.builtin.assert:
+        that:
+          - existing.rc != 0
+
+    - name: Create isolated working directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /var/tmp
+        suffix: _grafana_restore
+      register: workdir
+
+    - name: Run isolated Grafana recovery test
+      block:
+        - name: Create temporary data directory
+          ansible.builtin.file:
+            path: "{{ workdir.path }}/data"
+            state: directory
+            mode: '0700'
+
+        - name: Extract Grafana backup
+          ansible.builtin.script:
+            cmd: >-
+              ../files/extract-recovery-archive.py
+              {{ backup_archive | quote }} {{ (workdir.path ~ '/data') | quote }}
+            executable: /usr/bin/python3
+
+        - name: Confirm restored SQLite database exists
+          ansible.builtin.stat:
+            path: "{{ workdir.path }}/data/grafana.db"
+          register: database
+
+        - name: Require restored database
+          ansible.builtin.assert:
+            that:
+              - database.stat.isreg | default(false)
+
+        - name: Assign temporary data to Grafana user
+          ansible.builtin.file:
+            path: "{{ workdir.path }}/data"
+            state: directory
+            owner: "472"
+            group: "0"
+            recurse: true
+
+        - name: Create an empty directory for the dashboard provider
+          ansible.builtin.file:
+            path: "{{ workdir.path }}/empty-dashboards"
+            state: directory
+            mode: '0755'
+
+        - name: Preserve archived dashboards when their provisioning files are absent
+          ansible.builtin.copy:
+            dest: "{{ workdir.path }}/preserve-dashboards.yml"
+            mode: '0644'
+            content: |
+              apiVersion: 1
+              providers:
+                - name: HomeLab
+                  orgId: 1
+                  folder: HomeLab
+                  type: file
+                  disableDeletion: true
+                  options:
+                    path: /var/lib/grafana/dashboards
+
+        - name: Create the isolated Grafana container
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - create
+              - --label
+              - "dev.homelab.recovery={{ backup_run_id }}"
+              - --pull
+              - never
+              - --name
+              - "{{ test_container }}"
+              - --network
+              - none
+              - --read-only
+              - --tmpfs
+              - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+              - --memory
+              - 512m
+              - --cpus=1
+              - --pids-limit=256
+              - --cap-drop=ALL
+              - --security-opt
+              - no-new-privileges
+              - --user
+              - "472:0"
+              - --mount
+              - "type=bind,source={{ workdir.path }}/data,target=/var/lib/grafana"
+              - --mount
+              - "type=bind,source={{ workdir.path }}/empty-dashboards,target=/var/lib/grafana/dashboards,readonly"
+              - --mount
+              - "type=bind,source={{ workdir.path }}/preserve-dashboards.yml,target=/etc/grafana/provisioning/dashboards/preserve.yml,readonly"
+              - --env
+              - GF_LOG_MODE=console
+              - --env
+              - GF_PATHS_LOGS=/tmp/grafana-logs
+              - --env
+              - GF_SERVER_HTTP_ADDR=127.0.0.1
+              - --env
+              - "GF_AUTH_ANONYMOUS_ENABLED={{ (recovery_grafana_user | length == 0) | ternary('true', 'false') }}"
+              - --env
+              - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+              - --env
+              - GF_ANALYTICS_REPORTING_ENABLED=false
+              - --env
+              - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+              - grafana/grafana:13.3.1
+          register: test_run
+
+        - ansible.builtin.include_tasks: ../tasks/inspect-recovery-container.yml
+          vars:
+            recovery_mounts:
+              - source: "{{ workdir.path }}/data"
+                destination: /var/lib/grafana
+                writable: true
+              - source: "{{ workdir.path }}/empty-dashboards"
+                destination: /var/lib/grafana/dashboards
+                writable: false
+              - source: "{{ workdir.path }}/preserve-dashboards.yml"
+                destination: /etc/grafana/provisioning/dashboards/preserve.yml
+                writable: false
+
+        - name: Start the verified isolated Grafana container
+          ansible.builtin.command:
+            argv: [docker, --host, 'unix:///var/run/docker.sock', start, "{{ test_run.stdout }}"]
+
+        - name: Read the running Grafana container metadata
+          ansible.builtin.command:
+            argv: [docker, --host, 'unix:///var/run/docker.sock', inspect, "{{ test_run.stdout }}"]
+          register: test_inspect
+          changed_when: false
+
+        - name: Parse temporary container metadata
+          ansible.builtin.set_fact:
+            test_metadata: "{{ (test_inspect.stdout | from_json) | first }}"
+
+        - name: Check temporary Grafana HTTP health
+          ansible.builtin.command:
+            argv:
+              - nsenter
+              - --target
+              - "{{ test_metadata.State.Pid | string }}"
+              - --net
+              - curl
+              - --noproxy
+              - "*"
+              - -fsS
+              - --max-time
+              - "5"
+              - http://127.0.0.1:3000/api/health
+          register: health_result
+          retries: 20
+          delay: 3
+          until: health_result.rc == 0
+          changed_when: false
+
+        - name: Parse Grafana health response
+          ansible.builtin.set_fact:
+            restored_health: "{{ health_result.stdout | from_json }}"
+
+        - name: Require healthy restored Grafana database
+          ansible.builtin.assert:
+            that:
+              - restored_health.database == 'ok'
+              - restored_health.version == '13.3.1'
+
+        - name: Verify restored dashboard API inside the isolated namespace
+          ansible.builtin.command:
+            argv:
+              - nsenter
+              - --target
+              - "{{ test_metadata.State.Pid | string }}"
+              - --net
+              - /usr/bin/python3
+              - -c
+              - |
+                import base64, json, sys
+                from urllib.request import Request, build_opener, ProxyHandler
+
+                uid, user, password = json.load(sys.stdin)
+                opener = build_opener(ProxyHandler({}))
+                headers = {}
+                if user:
+                    credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
+                    headers = {"Authorization": "Basic " + credentials}
+
+                def get(path):
+                    request = Request("http://127.0.0.1:3000" + path, headers=headers)
+                    with opener.open(request, timeout=8) as response:
+                        return json.load(response)
+
+                dashboard = get("/apis/dashboard.grafana.app/v1/namespaces/default/dashboards/" + uid)
+                if dashboard.get("metadata", {}).get("name") != uid or not dashboard.get("spec", {}).get("panels"):
+                    sys.exit("Restored dashboard UID or panels missing")
+                if user and get("/api/user").get("login") != user:
+                    sys.exit("Restored identity mismatch")
+            stdin: "{{ [recovery_dashboard_uid, recovery_grafana_user, recovery_grafana_password] | to_json }}"
+          register: dashboard_check
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Require restored dashboard and optional authentication acceptance
+          ansible.builtin.assert:
+            that: dashboard_check.rc == 0
+            fail_msg: >-
+              The restored dashboard API or supplied credentials failed acceptance.
+              Verify the backup contains the expected dashboard and the account can view it.
+
+        - name: Report successful Grafana recovery
+          ansible.builtin.debug:
+            msg:
+              - "PASS: Restored Grafana 13.3.1 started"
+              - "PASS: Restored database is healthy"
+              - "PASS: No network or published ports"
+              - "PASS: Restored dashboard UID and panels retrieved through HTTP API"
+              - "{{ (recovery_grafana_user | length > 0) | ternary('PASS: Restored account authenticated', 'SKIP: Restored account authentication requires operator-supplied credentials') }}"
+
+      rescue:
+        - name: Collect Grafana startup logs
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - logs
+              - --tail
+              - "50"
+              - "{{ test_container }}"
+          register: startup_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Display startup diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "{{ startup_logs.stderr_lines | default([]) }}"
+              - "{{ startup_logs.stdout_lines | default([]) }}"
+
+        - name: Mark recovery test unsuccessful
+          ansible.builtin.fail:
+            msg: "Isolated Grafana recovery failed. Review startup logs."
+
+      always:
+        - name: Remove temporary Grafana container
+          ansible.builtin.command:
+            argv:
+              - docker
+              - --host
+              - unix:///var/run/docker.sock
+              - rm
+              - -f
+              - -v
+              - "{{ test_run.stdout }}"
+          when:
+            - test_run is defined
+            - test_run.rc | default(1) == 0
+          changed_when: false
+
+        - name: Remove temporary restored data
+          ansible.builtin.file:
+            path: "{{ workdir.path }}"
+            state: absent
+
+    - name: Verify host Grafana remains healthy
+      ansible.builtin.uri:
+        url: http://127.0.0.1:3000/api/health
+        status_code: 200
+        use_proxy: false
+      changed_when: false

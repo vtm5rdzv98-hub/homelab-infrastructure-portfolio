@@ -1,0 +1,140 @@
+---
+- import_playbook: 12-manage-docker-files.yml
+
+- name: Manage existing HomeLab Compose services
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    portal_dir: /home/labadmin/homelab-services/portal
+    monitoring_dir: /home/labadmin/homelab-services/monitoring
+
+  tasks:
+    - name: Record existing portal containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - ps
+          - --all
+          - --quiet
+        chdir: "{{ portal_dir }}"
+      register: portal_before
+      changed_when: false
+      check_mode: false
+
+    - name: Record existing monitoring containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - -f
+          - compose.grafana.yaml
+          - -f
+          - compose.alerts.yaml
+          - ps
+          - --all
+          - --quiet
+        chdir: "{{ monitoring_dir }}"
+      register: monitoring_before
+      changed_when: false
+      check_mode: false
+
+    - name: Require existing deployment
+      ansible.builtin.assert:
+        that:
+          - portal_before.stdout_lines | length == 1
+          - monitoring_before.stdout_lines | length == 3
+        fail_msg: "Container inventory differs. Refusing orchestration."
+
+    - name: Ensure portal service is running
+      community.docker.docker_compose_v2:
+        project_src: "{{ portal_dir }}"
+        files:
+          - compose.yaml
+        state: present
+        pull: never
+        build: never
+        recreate: never
+        remove_orphans: false
+        wait: true
+        wait_timeout: 60
+
+    - name: Ensure monitoring services are running
+      community.docker.docker_compose_v2:
+        project_src: "{{ monitoring_dir }}"
+        files:
+          - compose.yaml
+          - compose.grafana.yaml
+          - compose.alerts.yaml
+        state: present
+        pull: never
+        build: never
+        recreate: never
+        remove_orphans: false
+        wait: true
+        wait_timeout: 60
+
+    - name: Verify service endpoints
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item.port }}{{ item.path }}"
+        status_code: 200
+        timeout: 10
+        use_proxy: false
+      loop:
+        - { name: Portal, port: 8080, path: "/" }
+        - { name: Prometheus, port: 9090, path: "/-/ready" }
+        - { name: Grafana, port: 3000, path: "/api/health" }
+      loop_control:
+        label: "{{ item.name }}"
+      check_mode: false
+
+    - name: Record final portal container IDs
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - ps
+          - --all
+          - --quiet
+        chdir: "{{ portal_dir }}"
+      register: portal_after
+      changed_when: false
+      check_mode: false
+
+    - name: Record final monitoring container IDs
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - compose.yaml
+          - -f
+          - compose.grafana.yaml
+          - -f
+          - compose.alerts.yaml
+          - ps
+          - --all
+          - --quiet
+        chdir: "{{ monitoring_dir }}"
+      register: monitoring_after
+      changed_when: false
+      check_mode: false
+
+    - name: Verify no containers were recreated
+      ansible.builtin.assert:
+        that:
+          - >-
+            (portal_before.stdout_lines | sort) ==
+            (portal_after.stdout_lines | sort)
+          - >-
+            (monitoring_before.stdout_lines | sort) ==
+            (monitoring_after.stdout_lines | sort)
+        fail_msg: "Container inventory changed unexpectedly."

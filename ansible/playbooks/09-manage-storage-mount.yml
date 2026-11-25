@@ -1,0 +1,66 @@
+---
+- name: Manage existing HomeLab storage mount
+  hosts: lab-storage
+  become: true
+  gather_facts: false
+
+  vars:
+    data_mount: "/srv/homelab/data"
+    expected_fstab: "UUID={{ data_uuid }} {{ data_mount }} ext4 defaults 0 2"
+
+  tasks:
+    - name: Require the operator-confirmed data filesystem UUID
+      ansible.builtin.assert:
+        that:
+          - data_uuid | default('') is match('^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$')
+
+    - name: Verify logical volume UUID
+      ansible.builtin.command: >
+        blkid -s UUID -o value /dev/ubuntu-vg/data-lv
+      register: disk_uuid
+      changed_when: false
+      check_mode: false
+
+    - name: Verify mounted filesystem
+      ansible.builtin.command: >
+        findmnt -n -M /srv/homelab/data -o UUID,FSTYPE
+      register: mounted_fs
+      changed_when: false
+      check_mode: false
+
+    - name: Read existing fstab mount entry
+      ansible.builtin.shell: >
+        awk '$1 !~ /^#/ && $2 == "/srv/homelab/data"
+        {print $1, $2, $3, $4, $5, $6}' /etc/fstab
+      register: fstab_entry
+      changed_when: false
+      check_mode: false
+
+    - name: Require exact existing storage configuration
+      ansible.builtin.assert:
+        that:
+          - disk_uuid.stdout == data_uuid
+          - mounted_fs.stdout.split() == [data_uuid, 'ext4']
+          - fstab_entry.stdout_lines | length == 1
+          - fstab_entry.stdout == expected_fstab
+        fail_msg: "Unexpected storage configuration; refusing to modify fstab."
+
+    - name: Manage persistent mount entry
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^UUID={{ data_uuid }}\s+{{ data_mount }}\s+'
+        line: "{{ expected_fstab }}"
+        state: present
+        backup: true
+        create: false
+        validate: '/usr/bin/findmnt --verify --tab-file %s'
+
+    - name: Verify fstab syntax
+      ansible.builtin.command: >
+        findmnt --verify --tab-file /etc/fstab
+      changed_when: false
+      check_mode: false
+
+    - name: Report storage configuration
+      ansible.builtin.debug:
+        msg: "Persistent storage configuration verified for {{ data_mount }}"

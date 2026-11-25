@@ -1,0 +1,39 @@
+---
+- name: Inspect the new recovery container before starting it
+  ansible.builtin.command:
+    argv: [docker, --host, 'unix:///var/run/docker.sock', inspect, "{{ test_run.stdout }}"]
+  register: test_inspect
+  changed_when: false
+
+- name: Require exactly the private temporary bind mounts and isolated settings
+  ansible.builtin.assert:
+    that:
+      - not recovery_container.State.Running
+      - recovery_container.HostConfig.NetworkMode == 'none'
+      - not recovery_container.HostConfig.PortBindings
+      - recovery_container.HostConfig.ReadonlyRootfs
+      - not recovery_container.HostConfig.Privileged
+      - not recovery_container.HostConfig.VolumesFrom
+      - recovery_container.HostConfig.PidMode != 'host'
+      - recovery_container.HostConfig.Memory == 536870912
+      - recovery_container.HostConfig.NanoCpus == 1000000000
+      - recovery_container.HostConfig.PidsLimit == 256
+      - recovery_container.Mounts | length == recovery_mounts | length
+      - recovery_container.Mounts | selectattr('Type', 'equalto', 'bind') | list | length == recovery_mounts | length
+    fail_msg: "Recovery container does not match the approved isolated configuration."
+  vars:
+    recovery_container: "{{ (test_inspect.stdout | from_json) | first }}"
+
+- name: Check each recovery bind source, destination and access mode
+  ansible.builtin.assert:
+    that:
+      - >-
+        test_mounts | selectattr('Source', 'equalto', item.source) |
+        selectattr('Destination', 'equalto', item.destination) |
+        selectattr('RW', 'equalto', item.writable) | list | length == 1
+    quiet: true
+  loop: "{{ recovery_mounts }}"
+  loop_control:
+    label: "{{ item.destination }}"
+  vars:
+    test_mounts: "{{ ((test_inspect.stdout | from_json) | first).Mounts }}"

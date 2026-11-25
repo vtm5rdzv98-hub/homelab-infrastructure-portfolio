@@ -1,0 +1,48 @@
+---
+- name: Audit HomeLab dedicated storage volume
+  hosts: lab-storage
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Inspect dedicated filesystem mount
+      ansible.builtin.command: >
+        findmnt -n -M /srv/homelab/data
+        -o SOURCE,TARGET,FSTYPE,UUID
+      register: data_mount
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect logical volumes
+      ansible.builtin.command: >
+        lvs --noheadings
+        -o vg_name,lv_name,lv_size,lv_path
+      register: volumes
+      changed_when: false
+      check_mode: false
+
+    - name: Read persistent mount configuration
+      ansible.builtin.command: cat /etc/fstab
+      register: fstab
+      changed_when: false
+      check_mode: false
+
+    - name: Check storage files directory
+      ansible.builtin.stat:
+        path: /srv/homelab/data/files
+      register: files_directory
+
+    - name: Validate storage baseline
+      ansible.builtin.assert:
+        that:
+          - "'/srv/homelab/data' in data_mount.stdout"
+          - "'ext4' in data_mount.stdout"
+          - "'/srv/homelab/data' in fstab.stdout"
+          - files_directory.stat.isdir | default(false)
+
+    - name: Display storage configuration
+      ansible.builtin.debug:
+        msg:
+          - "Mounted filesystem: {{ data_mount.stdout }}"
+          - "Logical volumes: {{ volumes.stdout_lines }}"
+          - "Persistent mounts: {{ fstab.stdout_lines }}"

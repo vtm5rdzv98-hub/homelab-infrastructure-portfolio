@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: HomeLab
+    orgId: 1
+    folder: Infrastructure
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,313 @@
+---
+- name: Verify the intended fresh Ubuntu targets
+  hosts: homelab_fresh
+  any_errors_fatal: true
+  gather_facts: true
+  tasks:
+    - name: Require explicit opt-in and a dedicated fresh inventory
+      ansible.builtin.assert:
+        that:
+          - fresh_deploy | default(false) | bool
+          - groups.fresh_gateway | default([]) | length == 1
+          - groups.fresh_storage | default([]) | length == 1
+          - groups.homelab_fresh | length == 2
+          - inventory_hostname is match('^homelab-fresh-[a-z0-9][a-z0-9-]*-(gw|storage)$')
+          - ansible_facts.hostname == inventory_hostname
+          - ansible_facts.distribution == 'Ubuntu'
+          - fresh_gateway_ip != fresh_storage_ip
+          - (fresh_gateway_ip if 'fresh_gateway' in group_names else fresh_storage_ip) in ansible_facts.all_ipv4_addresses
+        fail_msg: "Fresh bootstrap requires two matching fresh Ubuntu hosts and explicit fresh_deploy=true."
+
+- name: Bootstrap common services and restrict SSH on the new guests
+  hosts: homelab_fresh
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+  vars:
+    fresh_wan_interface: labwan
+    fresh_lan_interface: lablan
+  tasks:
+    # Cloud-init reports the detached WAN adapter on subsequent isolated storage boots.
+    - name: Wait for cloud-init on guests with bootstrap networking
+      ansible.builtin.command:
+        argv: [timeout, "300", cloud-init, status, --wait]
+      changed_when: false
+      when: "'fresh_gateway' in group_names or ansible_facts.default_ipv4.gateway is defined"
+
+    - name: Install base and role-specific packages
+      ansible.builtin.apt:
+        name: "{{ ['curl', 'ufw', 'openssl'] + role_packages }}"
+        install_recommends: false
+        update_cache: "{{ ansible_facts.default_ipv4.gateway is defined }}"
+        cache_valid_time: "{{ 86400 if ansible_facts.default_ipv4.gateway is defined else omit }}"
+        lock_timeout: 120
+      vars:
+        role_packages: >-
+          {{ ['docker.io', 'docker-compose-v2'] if 'fresh_gateway' in group_names
+          else ['prometheus-node-exporter', 'e2fsprogs'] }}
+
+    - name: Permit key-authenticated SSH on the expected interface
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: "{{ fresh_wan_interface if 'fresh_gateway' in group_names else fresh_lan_interface }}"
+        from_ip: "{{ 'any' if 'fresh_gateway' in group_names else fresh_gateway_ip }}"
+        to_port: '22'
+        proto: tcp
+
+    - name: Allow the gateway to scrape the storage exporter
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: "{{ fresh_lan_interface }}"
+        from_ip: "{{ fresh_gateway_ip }}"
+        to_port: '9100'
+        proto: tcp
+      when: "'fresh_storage' in group_names"
+
+    - name: Set deny-by-default incoming firewall policy
+      community.general.ufw:
+        direction: incoming
+        default: deny
+
+    - name: Enable the guest firewall
+      community.general.ufw:
+        state: enabled
+
+    - name: Install the repository SSH hardening policy
+      ansible.builtin.copy:
+        src: ../files/00-homelab-hardening.conf
+        dest: /etc/ssh/sshd_config.d/00-homelab-hardening.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload SSH
+
+    - name: Verify effective SSH policy before reloading
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -T]
+      register: effective_sshd
+      changed_when: false
+      failed_when: >-
+        effective_sshd.rc != 0 or
+        (['pubkeyauthentication yes', 'passwordauthentication no',
+          'kbdinteractiveauthentication no', 'permitrootlogin no'] |
+          difference(effective_sshd.stdout_lines) | length > 0)
+
+    - name: Apply pending SSH configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Reopen a connection with the provisioned SSH key
+      ansible.builtin.meta: reset_connection
+
+    - name: Verify SSH and Python after enforcing the firewall
+      ansible.builtin.ping:
+
+  handlers:
+    - name: Reload SSH
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded
+
+- name: Provision the new storage guest
+  hosts: fresh_storage
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+  vars:
+    fresh_data_device: /dev/disk/by-path/pci-0000:00:0d.0-ata-2
+    data_mount: /srv/homelab/data
+  tasks:
+    - name: Inspect the separately attached data disk
+      ansible.builtin.command:
+        argv: [lsblk, --json, --paths, --output, 'TYPE,FSTYPE,LABEL,MOUNTPOINTS,UUID', "{{ fresh_data_device }}"]
+      register: data_disk
+      changed_when: false
+
+    - name: Refuse partitioned disks, unexpected filesystems, and in-use devices
+      ansible.builtin.assert:
+        that:
+          - disks | length == 1
+          - disk.type == 'disk'
+          - disk.children | default([]) | length == 0
+          - disk.fstype is none or (disk.fstype == 'ext4' and disk.label == 'homelab-data')
+          - disk.mountpoints | reject('none') | difference([data_mount]) | length == 0
+          - not disk.uuid or (disk.fstype == 'ext4' and disk.label == 'homelab-data')
+        fail_msg: "Expected the blank dedicated data disk or the existing homelab-data filesystem."
+      vars:
+        disks: "{{ (data_disk.stdout | from_json).blockdevices }}"
+        disk: "{{ disks[0] }}"
+
+    - name: Inspect signatures on the selected data disk
+      ansible.builtin.command:
+        argv: [wipefs, --no-act, --noheadings, --output, TYPE, "{{ fresh_data_device }}"]
+      register: disk_signatures
+      changed_when: false
+
+    - name: Refuse all unexpected on-disk signatures
+      ansible.builtin.assert:
+        that:
+          - (disk_signatures.stdout_lines | map('trim') | unique | list) in [[], ['ext4']]
+          - (disk_signatures.stdout | trim == '') == ((data_disk.stdout | from_json).blockdevices[0].fstype is none)
+
+    - name: Format the dedicated blank disk as ext4
+      ansible.builtin.command:
+        argv: [mkfs.ext4, -L, homelab-data, "{{ fresh_data_device }}"]
+      when: disk_signatures.stdout | trim == ''
+
+    - name: Read the data filesystem UUID
+      ansible.builtin.command:
+        argv: [blkid, -s, UUID, -o, value, "{{ fresh_data_device }}"]
+      register: data_uuid
+      changed_when: false
+      failed_when: data_uuid.rc != 0 or data_uuid.stdout is not match('^[0-9a-f-]{36}$')
+
+    - name: Read mounted and persistent records for the intended path
+      ansible.builtin.command:
+        argv: [findmnt, "{{ item }}", --noheadings, --raw, --output, 'UUID,FSTYPE', --mountpoint, "{{ data_mount }}"]
+      loop: [--kernel, --fstab]
+      register: mount_records
+      changed_when: false
+      failed_when: >-
+        mount_records.rc not in [0, 1] or
+        (mount_records.rc == 0 and mount_records.stdout != data_uuid.stdout ~ ' ext4')
+
+    - name: Create mountpoint
+      ansible.builtin.file:
+        path: "{{ data_mount }}"
+        state: directory
+        mode: '0755'
+
+    - name: Configure the persistent UUID mount
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^UUID={{ data_uuid.stdout }}\s+/srv/homelab/data\s'
+        line: "UUID={{ data_uuid.stdout }} {{ data_mount }} ext4 defaults 0 2"
+        validate: /usr/bin/findmnt --verify --tab-file %s
+
+    - name: Mount the filesystem
+      ansible.builtin.command:
+        argv: [mount, "{{ data_mount }}"]
+      when: mount_records.results[0].rc == 1
+
+    - name: Ensure the SFTP directory exists on the actual filesystem
+      ansible.builtin.file:
+        path: "{{ data_mount }}/files"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: '0750'
+
+    - name: Enable and start the storage exporter
+      ansible.builtin.service:
+        name: prometheus-node-exporter
+        enabled: true
+        state: started
+
+- name: Bring up services on the new gateway
+  hosts: fresh_gateway
+  become: true
+  gather_facts: false
+  vars:
+    deploy_root: /opt/homelab-services
+    assets: "{{ playbook_dir }}/../../services"
+  tasks:
+    - name: Enable Docker
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Create deployment directories
+      ansible.builtin.file:
+        path: "{{ deploy_root }}/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop: [portal, monitoring]
+
+    - name: Install canonical service files
+      ansible.builtin.copy:
+        src: "{{ assets }}/{{ item }}"
+        dest: "{{ deploy_root }}/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+        directory_mode: '0755'
+      loop:
+        - portal/compose.yaml
+        - portal/site/
+        - monitoring/compose.yaml
+        - monitoring/compose.alerts.yaml
+        - monitoring/compose.grafana.yaml
+        - monitoring/alerts.yml
+        - monitoring/grafana/
+      register: service_files
+
+    - name: Configure Prometheus storage scrape target
+      ansible.builtin.copy:
+        content: >-
+          {{ lookup('ansible.builtin.file', assets ~ '/monitoring/prometheus.yml', rstrip=false)
+          | replace("10.20.0.20:9100", fresh_storage_ip ~ ":9100") }}
+        dest: "{{ deploy_root }}/monitoring/prometheus.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      register: prometheus_config
+
+    - name: Create root-only directory for Compose secrets
+      ansible.builtin.file:
+        path: "{{ deploy_root }}/monitoring/secrets"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create a first-login Grafana secret if absent
+      ansible.builtin.shell:
+        cmd: 'umask 077; set -o noclobber; openssl rand -hex 32 > grafana_admin_password'
+        chdir: "{{ deploy_root }}/monitoring/secrets"
+        creates: grafana_admin_password
+        executable: /bin/bash
+      no_log: true
+
+    - name: Allow the Grafana container to read the individual secret mount
+      ansible.builtin.file:
+        path: "{{ deploy_root }}/monitoring/secrets/grafana_admin_password"
+        owner: root
+        group: root
+        mode: '0444'
+
+    - name: Deploy the portal and monitoring Compose stacks
+      community.docker.docker_compose_v2:
+        project_src: "{{ deploy_root }}/{{ item.directory }}"
+        files: "{{ item.compose_files }}"
+        state: present
+        wait: true
+        wait_timeout: 120
+      loop:
+        - directory: portal
+          compose_files: [compose.yaml]
+        - directory: monitoring
+          compose_files: [compose.yaml, compose.grafana.yaml, compose.alerts.yaml]
+      loop_control:
+        label: "{{ item.directory }}"
+
+    - name: Reload the Prometheus and Grafana service configuration after an update
+      community.docker.docker_compose_v2:
+        project_src: "{{ deploy_root }}/monitoring"
+        files: [compose.yaml, compose.grafana.yaml, compose.alerts.yaml]
+        services: [prometheus, grafana]
+        dependencies: false
+        state: restarted
+      when: prometheus_config.changed or service_files.changed
+
+    - name: Wait for portal and monitoring endpoints to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item }}"
+        use_proxy: false
+      register: endpoint
+      until: endpoint.status == 200
+      retries: 20
+      delay: 3
+      loop: ['8080/', '9090/-/ready', '3000/api/health']

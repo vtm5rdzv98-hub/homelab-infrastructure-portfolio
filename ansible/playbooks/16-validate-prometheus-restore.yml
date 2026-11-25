@@ -1,0 +1,77 @@
+---
+- name: Validate restored Prometheus TSDB
+  hosts: lab-gw
+  become: true
+  gather_facts: false
+
+  vars:
+    backup_root: /home/labadmin/homelab-monitoring-backups
+    backup_archive: >-
+      {{ backup_root }}/{{ backup_run_id }}/prometheus.tar.gz
+
+  tasks:
+    - name: Require an explicit UTC backup run ID and normal execution mode
+      ansible.builtin.assert:
+        that:
+          - backup_run_id | default('') is match('^[0-9]{8}T[0-9]{6}Z$')
+          - not ansible_check_mode
+
+    - name: Verify both monitoring archive checksums before extraction
+      ansible.builtin.import_tasks: ../tasks/verify-monitoring-archives.yml
+
+    - name: Verify backup archive exists
+      ansible.builtin.stat:
+        path: "{{ backup_archive }}"
+      register: backup_file
+
+    - name: Require archived data
+      ansible.builtin.assert:
+        that:
+          - backup_file.stat.isreg | default(false)
+
+    - name: Create isolated restore directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: _prometheus_restore
+      register: restore_dir
+
+    - name: Validate restored backup
+      block:
+        - name: Extract archived Prometheus data
+          ansible.builtin.unarchive:
+            src: "{{ backup_archive }}"
+            dest: "{{ restore_dir.path }}"
+            remote_src: true
+
+        - name: Inspect restored TSDB with promtool
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - --rm
+              - --network
+              - none
+              - --read-only
+              - --user
+              - "0:0"
+              - --mount
+              - "type=bind,source={{ restore_dir.path }},target=/restored"
+              - --entrypoint
+              - /bin/promtool
+              - prom/prometheus:v3.16.0
+              - tsdb
+              - list
+              - /restored
+          register: tsdb_result
+          changed_when: false
+
+        - name: Show TSDB inspection results
+          ansible.builtin.debug:
+            var: tsdb_result.stdout_lines
+
+      always:
+        - name: Remove temporary restored files
+          ansible.builtin.file:
+            path: "{{ restore_dir.path }}"
+            state: absent
+          when: restore_dir.path is defined

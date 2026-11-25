@@ -1,0 +1,40 @@
+---
+- name: Audit HomeLab firewall and private networking
+  hosts: homelab_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: Read UFW configuration
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+      check_mode: false
+
+    - name: Read numbered firewall rules
+      ansible.builtin.command: ufw status numbered
+      register: ufw_rules
+      changed_when: false
+      check_mode: false
+
+    - name: Read IPv4 interface addresses
+      ansible.builtin.command: ip -4 -br address
+      register: ip_addresses
+      changed_when: false
+      check_mode: false
+
+    - name: Read IPv4 routing table
+      ansible.builtin.command: ip -4 route show
+      register: ip_routes
+      changed_when: false
+      check_mode: false
+
+    - name: Display network security baseline
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "UFW: {{ ufw_status.stdout_lines }}"
+          - "Rules: {{ ufw_rules.stdout_lines }}"
+          - "Addresses: {{ ip_addresses.stdout_lines }}"
+          - "Routes: {{ ip_routes.stdout_lines }}"

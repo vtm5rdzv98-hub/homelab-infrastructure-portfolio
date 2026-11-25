@@ -1,0 +1,27 @@
+---
+- name: Manage HomeLab critical services
+  hosts: homelab_nodes
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Ensure SSH starts automatically
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: started
+        enabled: true
+
+    - name: Ensure Docker starts automatically on gateway
+      ansible.builtin.systemd_service:
+        name: docker
+        state: started
+        enabled: true
+      when: inventory_hostname == 'lab-gw'
+
+    - name: Ensure Node Exporter starts automatically on storage
+      ansible.builtin.systemd_service:
+        name: node-exporter
+        state: started
+        enabled: true
+      when: inventory_hostname == 'lab-storage'

@@ -1,0 +1,67 @@
+---
+- name: Audit HomeLab infrastructure
+  hosts: homelab_nodes
+  gather_facts: true
+
+  tasks:
+    - name: Verify Ubuntu operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+
+    - name: Check SSH hardening configuration
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d/00-homelab-hardening.conf
+      register: ssh_config
+
+    - name: Check SSH service
+      ansible.builtin.command: systemctl is-active ssh
+      register: ssh_status
+      changed_when: false
+      check_mode: false
+
+    - name: Verify SSH baseline
+      ansible.builtin.assert:
+        that:
+          - ssh_config.stat.exists
+          - ssh_status.stdout == 'active'
+
+    - name: Check Docker on gateway
+      ansible.builtin.command: systemctl is-active docker
+      register: docker_status
+      changed_when: false
+      check_mode: false
+      when: inventory_hostname == 'lab-gw'
+
+    - name: Verify gateway Docker service
+      ansible.builtin.assert:
+        that:
+          - docker_status.stdout == 'active'
+      when: inventory_hostname == 'lab-gw'
+
+    - name: Check storage filesystem mount
+      ansible.builtin.command: >
+        findmnt -n -M /srv/homelab/data
+        -o SOURCE,TARGET,FSTYPE
+      register: storage_mount
+      changed_when: false
+      check_mode: false
+      when: inventory_hostname == 'lab-storage'
+
+    - name: Check storage monitoring service
+      ansible.builtin.command: systemctl is-active node-exporter
+      register: exporter_status
+      changed_when: false
+      check_mode: false
+      when: inventory_hostname == 'lab-storage'
+
+    - name: Verify storage baseline
+      ansible.builtin.assert:
+        that:
+          - storage_mount.rc == 0
+          - exporter_status.stdout == 'active'
+      when: inventory_hostname == 'lab-storage'
+
+    - name: Display audit result
+      ansible.builtin.debug:
+        msg: "Baseline checks passed for {{ inventory_hostname }}"

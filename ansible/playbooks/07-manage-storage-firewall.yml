@@ -1,0 +1,69 @@
+---
+- name: Adopt existing storage firewall rules
+  hosts: lab-storage
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: Read existing UFW rules
+      ansible.builtin.command: ufw status verbose
+      register: ufw_before
+      changed_when: false
+      check_mode: false
+
+    - name: Read IPv4 default route
+      ansible.builtin.command: ip -4 route show default
+      register: routes
+      changed_when: false
+      check_mode: false
+
+    - name: Verify safe firewall baseline
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_before.stdout"
+          - "'Default: deny (incoming)' in ufw_before.stdout"
+          - "'22/tcp on enp0s8' in ufw_before.stdout"
+          - "'9100/tcp on enp0s8' in ufw_before.stdout"
+          - "(routes.stdout | trim) == ''"
+          - >-
+            (ufw_before.stdout_lines |
+            select('search', 'ALLOW IN') |
+            list | length) == 2
+          - >-
+            (ufw_before.stdout_lines |
+            select('search', 'ALLOW IN.*10[.]20[.]0[.]10') |
+            list | length) == 2
+        fail_msg: "Unexpected firewall state. Refusing to modify."
+
+    - name: Manage authorized gateway access
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: enp0s8
+        from_ip: 10.20.0.10
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "22"
+        - "9100"
+
+    - name: Read final UFW rules
+      ansible.builtin.command: ufw status verbose
+      register: ufw_after
+      changed_when: false
+      check_mode: false
+
+    - name: Verify firewall remains restricted
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_after.stdout"
+          - "'Default: deny (incoming)' in ufw_after.stdout"
+          - >-
+            (ufw_after.stdout_lines |
+            select('search', 'ALLOW IN') |
+            list | length) == 2
+          - >-
+            (ufw_after.stdout_lines |
+            select('search', 'ALLOW IN.*10[.]20[.]0[.]10') |
+            list | length) == 2

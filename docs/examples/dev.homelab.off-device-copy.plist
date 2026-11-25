@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.homelab.off-device-copy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/python3</string>
+    <string>/absolute/path/to/scripts/copy-backup.py</string>
+    <string>storage</string>
+    <string>/Volumes/Source SSD/HomeLab/Backups/lab-storage</string>
+    <string>/absolute/path/on/destination/private-homelab</string>
+    <string>--all-completed</string>
+    <string>--source-mount</string><string>/Volumes/Source SSD</string>
+    <string>--destination-mount</string><string>/absolute/path/to/destination/mount</string>
+    <string>--confirm-independent</string>
+    <string>--reserve-mib</string><string>256</string>
+    <string>--keep</string><string>14</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>21</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>/absolute/path/to/private/log-dir/off-device-copy.log</string>
+  <key>StandardErrorPath</key><string>/absolute/path/to/private/log-dir/off-device-copy-error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,57 @@
+---
+- name: Verify HomeLab network security policy
+  hosts: homelab_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Read firewall status
+      ansible.builtin.command: ufw status verbose
+      register: firewall
+      changed_when: false
+      check_mode: false
+
+    - name: Read IPv4 addresses
+      ansible.builtin.command: ip -4 -br address
+      register: addresses
+      changed_when: false
+      check_mode: false
+
+    - name: Read IPv4 default routes
+      ansible.builtin.command: ip -4 route show default
+      register: routes
+      changed_when: false
+      check_mode: false
+
+    - name: Verify gateway network policy
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in firewall.stdout"
+          - "'Default: deny (incoming)' in firewall.stdout"
+          - "'10.20.0.10/24' in addresses.stdout"
+          - "'10.0.2.15/24' in addresses.stdout"
+          - "'default via 10.0.2.2' in routes.stdout"
+      when: inventory_hostname == 'lab-gw'
+
+    - name: Verify storage isolation policy
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in firewall.stdout"
+          - "'Default: deny (incoming)' in firewall.stdout"
+          - "'10.20.0.20/24' in addresses.stdout"
+          - "(routes.stdout | trim) == ''"
+          - "'22/tcp on enp0s8' in firewall.stdout"
+          - "'9100/tcp on enp0s8' in firewall.stdout"
+          - >-
+            (firewall.stdout_lines |
+             select('search', 'ALLOW IN') |
+             list | length) == 2
+          - >-
+            (firewall.stdout_lines |
+             select('search', 'ALLOW IN.*10[.]20[.]0[.]10') |
+             list | length) == 2
+      when: inventory_hostname == 'lab-storage'
+
+    - name: Report compliance
+      ansible.builtin.debug:
+        msg: "Network policy verified: {{ inventory_hostname }}"
